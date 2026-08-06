@@ -10,188 +10,94 @@
 
 ## 检查点和页序提交
 
-对每个市场建立独立检查点。…1253 tokens truncated…shboard template."""
+对每个市场建立独立检查点。使用 checkpoint_state.py 的 init、reserve、stage、fail 和 retry 命令，检查点只用于本次运行恢复，不得随 ready HTML 交付。
 
-from __future__ import annotations
+    version, marketplace, date, searchModel
+    nextPage, nextCommitPage, inFlightPages, pendingPages, committedPages
+    keywordMap, noNewPages, retryQueue, stopReason, terminalReason
 
-import argparse
-import hashlib
-import json
-import math
-import re
-import sys
-from datetime import datetime
-from pathlib import Path
+请求语义：
 
-ALLOWED_MARKETPLACES = {
-    "US", "UK", "AU", "CA", "JP", "DE", "FR", "IT", "ES", "MX", "BR", "IN", "AE"
-}
-TOP_LEVEL_KEYS = {"status", "blockReason", "marketplace", "latestWeek", "previousWeek", "items"}
-ITEM_KEYS = {
-    "keyword", "zh", "currentAbaRank", "previousWeekAnomalyRank", "growthMultiple", "type"
-}
-TYPES = {"商品/工具", "图书/内容", "节日/季节", "品牌/专名"}
-BLOCK_REASONS = {
-    "no_valid_week_pair", "page_retry_exhausted", "execution_timeout", "batch_enrichment_failed"
-}
-DATE_PATTERN = re.compile(r"^\d{4}年\d{2}月\d{2}日$")
-PLACEHOLDER = "__ABA_OPPORTUNITY_DATA_JSON__"
-TEMPLATE_SHA256 = "94a2572946e5c312560c3d5b0dd268cd6441e96d2e96a2811b61e0e0b0832411"
-FORBIDDEN_STATIC_PATTERNS = (
-    re.compile(r"\bfetch\s*\(", re.IGNORECASE),
-    re.compile(r"\b(?:XMLHttpRequest|WebSocket|EventSource)\b", re.IGNORECASE),
-    re.compile(r"<\s*(?:script|link|img|iframe|audio|video)\b[^>]*(?:src|href)\s*=", re.IGNORECASE),
-    re.compile(r"@import\b", re.IGNORECASE),
-    re.compile(r"https?://", re.IGNORECASE),
-    re.compile(r"\b(?:localhost|127\.0\.0\.1)\b", re.IGNORECASE),
-    re.compile(r"monthlyTrendRecent24", re.IGNORECASE),
-)
-REQUIRED_TEMPLATE_MARKERS = (
-    "<h1>ABA 周交集机会 BI 看板</h1>",
-    "<div class=\"label\">快速飙升市场</div>",
-    "<div class=\"label\">异动市场</div>",
-    "<option value=\"current\">现 ABA 排名升序</option>",
-    "<option value=\"growth\">周搜索增长倍数降序</option>",
-    "<option value=\"previous\">前周异动排名升序</option>",
-    "<option>商品/工具</option>",
-    "<option>图书/内容</option>",
-    "<option>节日/季节</option>",
-    "<option>品牌/专名</option>",
-    "<th>英文关键词</th><th>中文翻译</th><th class=\"num\">现 ABA 排名</th><th class=\"num\">前周异动排名</th><th class=\"num\">搜索增长倍数</th><th>机会类型</th>",
-    "const EMBEDDED_DATA=__ABA_OPPORTUNITY_DATA_JSON__",
-)
+    marketplace = 用户站点
+    date        = 经验证的周六（yyyyMMdd）
+    searchModel = 4 或 2
+    page        = 当前页
+    size        = 40
+    fields      = keyword,searchRank,searches
 
+reserve 一次最多分配三页，最大并发三。页面可以乱序返回，但 stage 只能从 nextCommitPage 起连续提交；每次提交才计算唯一词、连续无新增页和停止条件。这样既保留并发，又保证“首次成功记录”和“五页连续无新增”按页码语义成立。
 
-def fail(message: str) -> None:
-    raise ValueError(message)
+若提交后达到 2,000 个唯一词或五页连续无新增，立即设置 stopReason；不再 reserve，且忽略已经在飞的高页结果。批次开始后等待至少 2 秒乘本批页数再发下一批，确保平均不高于每两秒一次请求、每分钟不超过 30 次。
 
+## 失败和恢复决策
 
-def positive_integer(value: object, field: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        fail(f"{field} must be a positive integer")
+| 条件 | 行动 | HTML 状态 | 检查点 |
+| --- | --- | --- | --- |
+| 站点无效 | 仅要求重新输入；不调用工具 | 不生成 | 不创建 |
+| 工具绑定不唯一或不明确 | 返回 blocked: tool_binding_ambiguous；不生成 | 不生成 | 不创建 |
+| 12 周内无有效周对 | 停止，不猜日期 | blocked，日期为空 | 不创建 |
+| ERROR_MAXIMUM_ACCESS_PER_MINUTE | 等待 70 秒，仅重试当前页 | 继续 | 保留 |
+| 其他瞬时错误 | 当前页等待 5、15、30 秒重试 | 继续 | 保留 |
+| 瞬时错误三次仍失败 | 写 terminalReason=page_retry_exhausted | blocked，日期为空 | 保留 |
+| 全流程满 15 分钟 | 停止派发并性能排查 | blocked，日期为空 | 保留 |
+| 批量翻译或分类不可恢复失败 | 不交付部分结果 | blocked，日期为空 | 保留 |
+| 两侧完成但交集为空 | 交付空表看板 | ready | 成功后删除 |
 
+blocked 数据必须为：
 
-def positive_number(value: object, field: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        fail(f"{field} must be a number")
-    if not math.isfinite(float(value)) or float(value) <= 0:
-        fail(f"{field} must be a finite positive number")
+    {
+      "status": "blocked",
+      "blockReason": "<deterministic reason>",
+      "marketplace": "US",
+      "latestWeek": "",
+      "previousWeek": "",
+      "items": []
+    }
 
+可用的确定性原因只使用：no_valid_week_pair、page_retry_exhausted、execution_timeout、batch_enrichment_failed。不要在 blockReason 中附原始响应或 searches。
 
-def parse_chinese_date(value: str, field: str) -> datetime:
-    if not isinstance(value, str) or not DATE_PATTERN.fullmatch(value):
-        fail(f"{field} must use yyyy年MM月dd日")
-    try:
-        return datetime.strptime(value, "%Y年%m月%d日")
-    except ValueError as exc:
-        fail(f"{field} is not a real date: {exc}")
+## 转换规则
 
+1. 仅保留两侧均存在的英文关键词。
+2. 两侧 searches 都是正数时，计算 growthMultiple = latestSearches / previousSearches；否则剔除。
+3. 显示增长倍数时使用两位小数和 ×，但数据保存为数值。
+4. 批量补充中文翻译并按以下优先级一次性分类：
+   1. 品牌/专名
+   2. 图书/内容
+   3. 节日/季节
+   4. 商品/工具
+5. 明显品牌词、书名、作者名、角色名或无法可靠翻译的专名，英文保留，中文写为 品牌词/书名/专名。
 
-def validate(data: object) -> dict:
-    if not isinstance(data, dict):
-        fail("input JSON must be an object")
-    if set(data) != TOP_LEVEL_KEYS:
-        fail(f"top-level keys must be exactly: {', '.join(sorted(TOP_LEVEL_KEYS))}")
-    status = data["status"]
-    if status not in {"ready", "blocked"}:
-        fail("status must be ready or blocked")
-    if data["marketplace"] not in ALLOWED_MARKETPLACES:
-        fail("marketplace is invalid")
-    if not isinstance(data["blockReason"], str):
-        fail("blockReason must be a string")
-    if not isinstance(data["latestWeek"], str) or not isinstance(data["previousWeek"], str):
-        fail("week values must be strings")
-    if not isinstance(data["items"], list):
-        fail("items must be an array")
-    if len(data["items"]) > 2000:
-        fail("items cannot exceed 2000")
+## 嵌入数据
 
-    if status == "ready":
-        latest = parse_chinese_date(data["latestWeek"], "latestWeek")
-        previous = parse_chinese_date(data["previousWeek"], "previousWeek")
-        if (latest - previous).days != 7:
-            fail("ready weeks must be exactly seven days apart")
-        if data["blockReason"]:
-            fail("ready data must have an empty blockReason")
-    else:
-        if data["blockReason"] not in BLOCK_REASONS:
-            fail("blocked data must use a deterministic blockReason")
-        if data["latestWeek"] or data["previousWeek"] or data["items"]:
-            fail("blocked data must have empty weeks and no items")
+ready 数据仅接受以下顶层字段：
 
-    seen = set()
-    for index, item in enumerate(data["items"]):
-        if not isinstance(item, dict) or set(item) != ITEM_KEYS:
-            fail(f"item {index} must contain only the six dashboard fields")
-        for field in ("keyword", "zh"):
-            if not isinstance(item[field], str) or not item[field].strip():
-                fail(f"item {index} {field} must be a non-empty string")
-        if item["keyword"] in seen:
-            fail(f"item {index} duplicates keyword {item['keyword']}")
-        seen.add(item["keyword"])
-        positive_integer(item["currentAbaRank"], f"item {index} currentAbaRank")
-        positive_integer(item["previousWeekAnomalyRank"], f"item {index} previousWeekAnomalyRank")
-        positive_number(item["growthMultiple"], f"item {index} growthMultiple")
-        if item["type"] not in TYPES:
-            fail(f"item {index} type is invalid")
-    return data
+    {
+      "status": "ready",
+      "blockReason": "",
+      "marketplace": "US",
+      "latestWeek": "2026年07月18日",
+      "previousWeek": "2026年07月11日",
+      "items": [
+        {
+          "keyword": "example keyword",
+          "zh": "示例中文",
+          "currentAbaRank": 1,
+          "previousWeekAnomalyRank": 2,
+          "growthMultiple": 2.5,
+          "type": "商品/工具"
+        }
+      ]
+    }
 
+items 的每一项只能含示例所列六个字段，最多 2,000 项。不得携带 searches、调试信息或原始 API 字段。ready 的两个日期必须是中文格式，且相差七天；items 允许为空。
 
-def validate_template(template: str, raw_template: bytes) -> None:
-    digest = hashlib.sha256(raw_template).hexdigest()
-    if digest != TEMPLATE_SHA256:
-        fail("template hash differs from the approved fixed template")
-    if template.count(PLACEHOLDER) != 1:
-        fail("template must contain exactly one data placeholder")
-    if any(pattern.search(template) for pattern in FORBIDDEN_STATIC_PATTERNS):
-        fail("template contains an external runtime dependency or forbidden monthly field")
-    missing = [marker for marker in REQUIRED_TEMPLATE_MARKERS if marker not in template]
-    if missing:
-        fail("template is missing required fixed UI markers")
+## 文件名、附件与验收
 
-
-def expected_filename(data: dict) -> str:
-    if data["status"] == "blocked":
-        return f"aba_weekly_keyword_opportunity_{data['marketplace']}_unavailable.html"
-    date = data["latestWeek"].replace("年", "").replace("月", "").replace("日", "")
-    return f"aba_weekly_keyword_opportunity_{data['marketplace']}_{date}.html"
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", required=True, type=Path, help="normalized embedded JSON")
-    parser.add_argument("--output", required=True, type=Path, help="single HTML delivery file")
-    parser.add_argument(
-        "--template",
-        type=Path,
-        default=Path(__file__).resolve().parents[1] / "assets" / "aba_weekly_keyword_opportunity_template.html",
-        help="immutable skill template",
-    )
-    args = parser.parse_args()
-    try:
-        data = validate(json.loads(args.data.read_text(encoding="utf-8")))
-        if args.output.name != expected_filename(data):
-            fail(f"output filename must be {expected_filename(data)}")
-        raw_template = args.template.read_bytes()
-        template = raw_template.decode("utf-8")
-        validate_template(template, raw_template)
-        embedded = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        html = template.replace(PLACEHOLDER, embedded)
-        if PLACEHOLDER in html or html.count("const EMBEDDED_DATA=") != 1:
-            fail("embedded data replacement failed")
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(html, encoding="utf-8", newline="\n")
-        print(json.dumps({
-            "output": str(args.output),
-            "status": data["status"],
-            "marketplace": data["marketplace"],
-            "items": len(data["items"]),
-        }, ensure_ascii=False))
-        return 0
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"build_dashboard: {exc}", file=sys.stderr)
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+- ready 文件名严格为 aba_weekly_keyword_opportunity_<站点>_<最新周yyyyMMdd>.html。
+- 仅当没有可验证的最新周时，blocked 文件名严格为 aba_weekly_keyword_opportunity_<站点>_unavailable.html。
+- 没有可写本地目录时，通过平台附件交付同一 HTML；不得以 CSV、外部 JSON、固定端口或 localhost 服务替代。
+- 模板 SHA-256 由构建脚本锁定，且只接受一个数据占位符。生成时只允许替换该占位符。
+- 构建脚本会拒绝 fetch、XHR、WebSocket、EventSource、远程 URL、外部资源标签、@import、localhost 和月度趋势字段。
+- 模板哈希验证通过后，页面固定包含标题、站点与两个周次卡片、搜索框、三种固定排序、四种固定类型筛选、六列表格、详情与 Top 10；前一周卡片只能标注“异动市场”。
+- 明细表、详情和 Top 10 均不得展示 searches 原值。
