@@ -1,2 +1,58 @@
-# kuajing-wulaoshi-aba-weekly-keyword-opportunity-dashboard-skill
-跨境吴老师｜基于卖家精灵 ABA 周度数据，生成“快速飙升市场 × 异动市场”关键词精确交集机会的离线 BI 看板
+# 跨境吴老师 ABA 周交集关键词机会 BI 看板 Skill
+
+基于卖家精灵 ABA 周度数据，将“快速飙升市场”和“异动市场”的英文关键词做精确交集，生成可离线打开的机会 BI 看板。
+
+## 适用场景
+
+- 需要发现两个相邻周 ABA 市场共同出现的关键词机会。
+- 需要按 ABA 排名、周搜索增长倍数和机会类型筛选关键词。
+- 需要生成不依赖外部资源的单文件 HTML 看板。
+
+## 启动方式
+
+在 Codex 中输入：
+
+    使用 $aba-weekly-keyword-opportunity-dashboard 生成 ABA 周交集关键词机会 BI 看板。
+
+未提供站点时，Skill 固定提示：
+
+    跨境吴老师 ABA 周交集关键词机会 BI 看板已启动。请输入 Amazon 站点（US、UK、AU、CA、JP、DE、FR、IT、ES、MX、BR、IN、AE）；留空默认 US。
+
+## 首次安装
+
+此仓库当前为公开仓库，无需提交 GitHub 用户名或接受访问邀请。
+
+### 1. 在 Codex 中发出安装指令
+
+打开 Codex，新建一个对话，输入：
+
+    请从以下 GitHub 仓库安装跨境吴老师 ABA 周交集关键词机会 BI 看板 Skill：
+    https://github.com/defway888-design/kuajing-wulaoshi-aba-weekly-keyword-opportunity-dashboard-skill
+
+按照 Codex 提示完成 GitHub 授权。
+
+### 2. 重启 Codex
+
+安装完成后，关闭并重新打开 Codex，使 Skill 生效。
+
+## 执行结果
+
+Skill 会先唯一绑定当前环境中的卖家精灵周度 ABA 数据能力，再验证最新可用周与前一周；随后按限流、分页、检查点和精确交集规则处理数据，并交付单文件 HTML 看板。
+
+若工具绑定不明确、周次不可用、分页重试耗尽、执行超时或批量分类失败，则输出受控的异常状态，不会交付部分数据。
+
+## 仓库文件
+
+- SKILL.md：执行规则、固定启动引导语与交付逻辑。
+- agents/openai.yaml：Codex 界面元数据。
+- references/aba-weekly-opportunity-contract.md：数据、恢复、文件命名和验收契约。
+- scripts/checkpoint_state.py：并发分页的有序提交与检查点管理。
+- scripts/build_dashboard.py：固定模板、数据结构、文件名和离线依赖校验。
+- assets/aba_weekly_keyword_opportunity_template.html：唯一允许使用的离线看板模板。
+
+## 使用注意
+
+- 只允许调用已唯一绑定的 aba_research_weekly；不得使用 ABA 趋势或月度历史接口。
+- 不得修改固定 HTML 模板；只可替换嵌入数据占位符。
+- 不在 HTML、明细、详情、Top 10 或最终回复中展示 searches 原值。
+- 不要将 GitHub 密码、访问令牌或其他凭据提交到仓库。
