@@ -25,7 +25,7 @@ BLOCK_REASONS = {
 }
 DATE_PATTERN = re.compile(r"^\d{4}年\d{2}月\d{2}日$")
 PLACEHOLDER = "__ABA_OPPORTUNITY_DATA_JSON__"
-TEMPLATE_SHA256 = "94a2572946e5c312560c3d5b0dd268cd6441e96d2e96a2811b61e0e0b0832411"
+TEMPLATE_SHA256 = "2dba23cc67a60353eb824962fe778f114b92666fbbeddd981f33bc8df704a563"
 FORBIDDEN_STATIC_PATTERNS = (
     re.compile(r"\bfetch\s*\(", re.IGNORECASE),
     re.compile(r"\b(?:XMLHttpRequest|WebSocket|EventSource)\b", re.IGNORECASE),
@@ -36,7 +36,7 @@ FORBIDDEN_STATIC_PATTERNS = (
     re.compile(r"monthlyTrendRecent24", re.IGNORECASE),
 )
 REQUIRED_TEMPLATE_MARKERS = (
-    "<h1>ABA 周交集机会 BI 看板</h1>",
+    "<h1>跨境吴老师 ABA 周交集机会 BI 看板</h1>",
     "<div class=\"label\">快速飙升市场</div>",
     "<div class=\"label\">异动市场</div>",
     "<option value=\"current\">现 ABA 排名升序</option>",
