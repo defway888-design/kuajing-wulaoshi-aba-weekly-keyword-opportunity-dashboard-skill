@@ -14,7 +14,7 @@
 
 对每个市场建立独立检查点。使用 checkpoint_state.py 的 init、reserve、stage、fail 和 retry 命令，检查点只用于本次运行恢复，不得随 ready HTML 交付。
 
-    version, marketplace, date, searchModel
+    version, marketplace, date, searchModel, deadlineEpoch
     nextPage, nextCommitPage, inFlightPages, pendingPages, committedPages
     keywordMap, noNewPages, retryQueue, stopReason, terminalReason
 
@@ -27,9 +27,13 @@
     size        = 40
     fields      = keyword,searchRank,searches
 
-reserve 一次最多分配三页，最大并发三。页面可以乱序返回，但 stage 只能从 nextCommitPage 起连续提交；每次提交才计算唯一词、连续无新增页和停止条件。这样既保留并发，又保证“首次成功记录”和“五页连续无新增”按页码语义成立。
+在工具发现前记录一次 `runStartedEpoch`；两个市场的 init 都传入此值，检查点据此保存 `deadlineEpoch = runStartedEpoch + 900`。每次 reserve、retry、stage、fail 和显式 check 都会核验该绝对截止；不得在第二个市场、重试或恢复时重置。
 
-若提交后达到 2,000 个唯一词或五页连续无新增，立即设置 stopReason；不再 reserve，且忽略已经在飞的高页结果。批次开始后等待至少 2 秒乘本批页数再发下一批，确保平均不高于每两秒一次请求、每分钟不超过 30 次。
+reserve 一次最多分配三页，且只允许在没有在途页、重试页和待提交页时执行。页面可以乱序返回，但必须先让整批页面 stage 或 fail；存在失败页时只能 retry 页码最小的失败页，禁止 reserve 更高页。stage 只能从 nextCommitPage 起连续提交；每次提交才计算唯一词、连续无新增页和停止条件。这样既保留批内并发，又保证“首次成功记录”和“五页连续无新增”按页码语义成立。
+
+若提交后达到 2,000 个唯一词或五页连续无新增，立即设置 stopReason；不再 reserve，且忽略截止或中断后才返回的高页结果。两个市场顺序抓取，整体（不是每一侧）最大并发三。批次开始后等待至少 2 秒乘本批页数再发下一批，确保平均不高于每两秒一次请求、每分钟不超过 30 次。
+
+运行剩余不超过 30 秒时不再派发新页。到 `deadlineEpoch` 后，脚本把 terminalReason 设为 `execution_timeout` 并拒绝迟到 stage；外部 MCP 调用若已经悬挂，只能在返回后被拒收，不能由检查点脚本强行终止。
 
 ## 失败和恢复决策
 
@@ -38,10 +42,12 @@ reserve 一次最多分配三页，最大并发三。页面可以乱序返回，
 | 站点无效 | 仅要求重新输入；不调用工具 | 不生成 | 不创建 |
 | 工具绑定不唯一或不明确 | 返回 blocked: tool_binding_ambiguous；不生成 | 不生成 | 不创建 |
 | 12 周内无有效周对 | 停止，不猜日期 | blocked，日期为空 | 不创建 |
-| ERROR_MAXIMUM_ACCESS_PER_MINUTE | 等待 70 秒，仅重试当前页 | 继续 | 保留 |
-| 其他瞬时错误 | 当前页等待 5、15、30 秒重试 | 继续 | 保留 |
+| ERROR_MAXIMUM_ACCESS_PER_MINUTE | 写入脱敏 code，等待 70 秒；优先重试最小失败页 | 继续 | 保留 |
+| 其他瞬时错误 | 写入脱敏错误类别；当前页等待 5、15、30 秒重试 | 继续 | 保留 |
 | 瞬时错误三次仍失败 | 写 terminalReason=page_retry_exhausted | blocked，日期为空 | 保留 |
-| 全流程满 15 分钟 | 停止派发并性能排查 | blocked，日期为空 | 保留 |
+| 全流程满 15 分钟 | `check` 写 terminalReason=execution_timeout；停止派发与重试 | blocked，日期为空 | 保留 |
+| 用户明确中断 | `interrupt` 标记执行中断，不接纳迟到结果 | 不生成 | 保留 |
+| 用户明确要求恢复 | `resume` 回收残留在途页，使用新的 15 分钟运行窗口 | 继续 | 保留 |
 | 批量翻译或分类不可恢复失败 | 不交付部分结果 | blocked，日期为空 | 保留 |
 | 两侧完成但交集为空 | 交付空表看板 | ready | 成功后删除 |
 
@@ -57,6 +63,8 @@ blocked 数据必须为：
     }
 
 可用的确定性原因只使用：no_valid_week_pair、page_retry_exhausted、execution_timeout、batch_enrichment_failed。不要在 blockReason 中附原始响应或 searches。
+
+失败页的 checkpoint reason 只允许保存业务 code、HTTP/连接类别或 `page_error` 等脱敏类别；最终简报只报告失败页码和类别，不报告关键词、原始响应或 searches。
 
 ## 转换规则
 

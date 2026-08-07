@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persist ABA weekly pagination state with ordered commits and atomic checkpoints."""
+"""Persist ABA weekly pagination state with ordered commits and hard deadlines."""
 
 from __future__ import annotations
 
@@ -7,22 +7,31 @@ import argparse
 import json
 import math
 import os
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 ALLOWED_MARKETPLACES = {
     "US", "UK", "AU", "CA", "JP", "DE", "FR", "IT", "ES", "MX", "BR", "IN", "AE"
 }
 VALID_MODELS = {2, 4}
-STATE_KEYS = {
+RUN_TIMEOUT_SECONDS = 15 * 60
+STATE_KEYS_V1 = {
     "version", "marketplace", "date", "searchModel", "nextPage", "nextCommitPage",
     "inFlightPages", "pendingPages", "committedPages", "keywordMap", "noNewPages",
-    "retryQueue", "stopReason", "terminalReason"
+    "retryQueue", "stopReason", "terminalReason",
 }
+STATE_KEYS = STATE_KEYS_V1 | {"deadlineEpoch"}
+TERMINAL_REASONS = {"", "page_retry_exhausted", "execution_timeout", "execution_interrupted"}
 
 
 def fail(message: str) -> None:
     raise ValueError(message)
+
+
+def now_epoch() -> int:
+    return int(time.time())
 
 
 def load_json(path: Path) -> object:
@@ -45,10 +54,35 @@ def write_atomic(path: Path, data: dict) -> None:
         raise
 
 
-def validate_state(state: object) -> dict:
+def positive_page(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        fail(f"{field} must be a positive page number")
+    return value
+
+
+def page_list(value: object, field: str) -> list[int]:
+    if not isinstance(value, list):
+        fail(f"checkpoint {field} must be an array")
+    pages = [positive_page(page, field) for page in value]
+    if len(set(pages)) != len(pages):
+        fail(f"checkpoint {field} contains duplicate pages")
+    return pages
+
+
+def migrate_v1(state: object) -> object:
+    if isinstance(state, dict) and state.get("version") == 1 and set(state) == STATE_KEYS_V1:
+        migrated = dict(state)
+        migrated["version"] = 2
+        migrated["deadlineEpoch"] = 0
+        return migrated
+    return state
+
+
+def validate_state(raw_state: object) -> dict:
+    state = migrate_v1(raw_state)
     if not isinstance(state, dict) or set(state) != STATE_KEYS:
         fail("checkpoint has an invalid state schema")
-    if state["version"] != 1:
+    if state["version"] != 2:
         fail("unsupported checkpoint version")
     if state["marketplace"] not in ALLOWED_MARKETPLACES:
         fail("checkpoint marketplace is invalid")
@@ -56,18 +90,60 @@ def validate_state(state: object) -> dict:
         fail("checkpoint date must use yyyyMMdd")
     if state["searchModel"] not in VALID_MODELS:
         fail("checkpoint searchModel is invalid")
-    for key in ("nextPage", "nextCommitPage", "noNewPages"):
-        if not isinstance(state[key], int) or state[key] < 0:
-            fail(f"checkpoint {key} is invalid")
-    for key in ("inFlightPages", "committedPages", "retryQueue"):
-        if not isinstance(state[key], list):
-            fail(f"checkpoint {key} must be an array")
-    for key in ("pendingPages", "keywordMap"):
-        if not isinstance(state[key], dict):
-            fail(f"checkpoint {key} must be an object")
-    for key in ("stopReason", "terminalReason"):
-        if not isinstance(state[key], str):
-            fail(f"checkpoint {key} must be a string")
+    for key in ("nextPage", "nextCommitPage"):
+        positive_page(state[key], key)
+    if not isinstance(state["noNewPages"], int) or state["noNewPages"] < 0:
+        fail("checkpoint noNewPages is invalid")
+    if isinstance(state["deadlineEpoch"], bool) or not isinstance(state["deadlineEpoch"], int) or state["deadlineEpoch"] < 0:
+        fail("checkpoint deadlineEpoch is invalid")
+
+    in_flight = page_list(state["inFlightPages"], "inFlightPages")
+    if len(in_flight) > 3:
+        fail("checkpoint has more than three in-flight pages")
+    committed = page_list(state["committedPages"], "committedPages")
+    if committed != sorted(committed):
+        fail("checkpoint committedPages must be ordered")
+    if not isinstance(state["pendingPages"], dict):
+        fail("checkpoint pendingPages must be an object")
+    pending = []
+    for page, records in state["pendingPages"].items():
+        try:
+            pending_page = positive_page(int(page), "pendingPages key")
+        except (TypeError, ValueError):
+            fail("checkpoint pendingPages key is invalid")
+        if str(pending_page) != page or not isinstance(records, list):
+            fail("checkpoint pendingPages is invalid")
+        pending.append(pending_page)
+    if len(set(pending)) != len(pending):
+        fail("checkpoint pendingPages contains duplicate pages")
+
+    if not isinstance(state["keywordMap"], dict):
+        fail("checkpoint keywordMap must be an object")
+    if not isinstance(state["retryQueue"], list):
+        fail("checkpoint retryQueue must be an array")
+    retry_pages = []
+    for entry in state["retryQueue"]:
+        if not isinstance(entry, dict) or set(entry) != {"page", "attempts", "reason"}:
+            fail("checkpoint retryQueue entry is invalid")
+        page = positive_page(entry["page"], "retryQueue page")
+        if isinstance(entry["attempts"], bool) or not isinstance(entry["attempts"], int) or entry["attempts"] < 0:
+            fail("checkpoint retryQueue attempts is invalid")
+        if not isinstance(entry["reason"], str) or not entry["reason"]:
+            fail("checkpoint retryQueue reason is invalid")
+        retry_pages.append(page)
+    if len(set(retry_pages)) != len(retry_pages):
+        fail("checkpoint retryQueue contains duplicate pages")
+
+    if set(committed) & set(in_flight) or set(committed) & set(pending) or set(committed) & set(retry_pages):
+        fail("checkpoint page ownership overlaps committed pages")
+    if set(pending) & set(in_flight) or set(pending) & set(retry_pages):
+        fail("checkpoint page ownership overlaps pending pages")
+    if not isinstance(state["stopReason"], str) or not isinstance(state["terminalReason"], str):
+        fail("checkpoint terminal fields must be strings")
+    if state["terminalReason"] not in TERMINAL_REASONS:
+        fail("checkpoint terminalReason is invalid")
+    if state["nextPage"] <= max([0, *in_flight, *pending, *committed, *retry_pages]):
+        fail("checkpoint nextPage is not ahead of reserved pages")
     return state
 
 
@@ -98,6 +174,36 @@ def records_from(path: Path) -> list[dict]:
     return normalized
 
 
+def expire_if_needed(state: dict) -> bool:
+    if (
+        not state["stopReason"]
+        and not state["terminalReason"]
+        and state["deadlineEpoch"]
+        and now_epoch() >= state["deadlineEpoch"]
+    ):
+        state["terminalReason"] = "execution_timeout"
+        return True
+    return state["terminalReason"] == "execution_timeout"
+
+
+def deadline_from_started_epoch(started_epoch: int) -> int:
+    if started_epoch < 1:
+        fail("started epoch must be positive")
+    if started_epoch > now_epoch() + 5:
+        fail("started epoch cannot be in the future")
+    return started_epoch + RUN_TIMEOUT_SECONDS
+
+
+def retry_entry(state: dict, page: int) -> dict | None:
+    return next((entry for entry in state["retryQueue"] if entry["page"] == page), None)
+
+
+def queue_retry(state: dict, page: int, attempts: int, reason: str) -> None:
+    state["retryQueue"] = [entry for entry in state["retryQueue"] if entry["page"] != page]
+    state["retryQueue"].append({"page": page, "attempts": attempts, "reason": reason})
+    state["retryQueue"].sort(key=lambda entry: entry["page"])
+
+
 def command_init(args: argparse.Namespace) -> dict:
     if args.marketplace not in ALLOWED_MARKETPLACES:
         fail("marketplace is invalid")
@@ -106,10 +212,9 @@ def command_init(args: argparse.Namespace) -> dict:
     if len(args.date) != 8 or not args.date.isdigit():
         fail("date must use yyyyMMdd")
     first_page = args.first_page
-    if first_page < 1:
-        fail("first page must be positive")
+    positive_page(first_page, "first page")
     state = {
-        "version": 1,
+        "version": 2,
         "marketplace": args.marketplace,
         "date": args.date,
         "searchModel": args.search_model,
@@ -123,22 +228,29 @@ def command_init(args: argparse.Namespace) -> dict:
         "retryQueue": [],
         "stopReason": "",
         "terminalReason": "",
+        "deadlineEpoch": deadline_from_started_epoch(args.started_epoch),
     }
+    expire_if_needed(state)
     write_atomic(args.checkpoint, state)
     return state
 
 
 def command_reserve(args: argparse.Namespace) -> dict:
     state = validate_state(load_json(args.checkpoint))
-    if state["stopReason"] or state["terminalReason"]:
+    if expire_if_needed(state) or state["stopReason"] or state["terminalReason"]:
+        write_atomic(args.checkpoint, state)
+        state["reservedPages"] = []
         return state
-    count = args.count
-    if count < 1 or count > 3:
+    if state["inFlightPages"] or state["retryQueue"]:
+        write_atomic(args.checkpoint, state)
+        state["reservedPages"] = []
+        return state
+    if state["pendingPages"]:
+        fail("cannot reserve while pending pages await contiguous commit")
+    if args.count < 1 or args.count > 3:
         fail("reserve count must be from 1 to 3")
-    active = len(state["inFlightPages"])
-    count = min(count, 3 - active)
-    pages = list(range(state["nextPage"], state["nextPage"] + count))
-    state["nextPage"] += count
+    pages = list(range(state["nextPage"], state["nextPage"] + args.count))
+    state["nextPage"] += args.count
     state["inFlightPages"].extend(pages)
     write_atomic(args.checkpoint, state)
     state["reservedPages"] = pages
@@ -147,6 +259,9 @@ def command_reserve(args: argparse.Namespace) -> dict:
 
 def command_stage(args: argparse.Namespace) -> dict:
     state = validate_state(load_json(args.checkpoint))
+    if expire_if_needed(state) or state["terminalReason"]:
+        write_atomic(args.checkpoint, state)
+        return state
     if args.page not in state["inFlightPages"]:
         fail("page was not reserved or has already been handled")
     state["inFlightPages"].remove(args.page)
@@ -175,13 +290,15 @@ def command_stage(args: argparse.Namespace) -> dict:
 
 def command_fail(args: argparse.Namespace) -> dict:
     state = validate_state(load_json(args.checkpoint))
+    if expire_if_needed(state) or state["terminalReason"]:
+        write_atomic(args.checkpoint, state)
+        return state
     if args.page not in state["inFlightPages"]:
         fail("page was not reserved or has already been handled")
     state["inFlightPages"].remove(args.page)
-    prior = next((entry for entry in state["retryQueue"] if entry["page"] == args.page), None)
+    prior = retry_entry(state, args.page)
     attempts = (prior["attempts"] if prior else 0) + 1
-    state["retryQueue"] = [entry for entry in state["retryQueue"] if entry["page"] != args.page]
-    state["retryQueue"].append({"page": args.page, "attempts": attempts, "reason": args.reason})
+    queue_retry(state, args.page, attempts, args.reason)
     if attempts >= 3 and args.reason != "ERROR_MAXIMUM_ACCESS_PER_MINUTE":
         state["terminalReason"] = "page_retry_exhausted"
     write_atomic(args.checkpoint, state)
@@ -190,27 +307,83 @@ def command_fail(args: argparse.Namespace) -> dict:
 
 def command_retry(args: argparse.Namespace) -> dict:
     state = validate_state(load_json(args.checkpoint))
+    if expire_if_needed(state):
+        write_atomic(args.checkpoint, state)
+        return state
     if state["stopReason"] or state["terminalReason"]:
         fail("cannot retry a stopped or terminal checkpoint")
-    if args.page in state["inFlightPages"]:
-        fail("page is already in flight")
-    if not any(entry["page"] == args.page for entry in state["retryQueue"]):
-        fail("page is not queued for retry")
-    if len(state["inFlightPages"]) >= 3:
-        fail("maximum in-flight page count reached")
+    if state["inFlightPages"]:
+        fail("cannot retry until the active batch has settled")
+    if not state["retryQueue"]:
+        fail("no page is queued for retry")
+    current_page = min(entry["page"] for entry in state["retryQueue"])
+    if args.page != current_page:
+        fail(f"must retry the earliest failed page first: {current_page}")
     state["inFlightPages"].append(args.page)
     write_atomic(args.checkpoint, state)
     return state
 
 
+def command_check(args: argparse.Namespace) -> dict:
+    state = validate_state(load_json(args.checkpoint))
+    expire_if_needed(state)
+    write_atomic(args.checkpoint, state)
+    return state
+
+
+def command_interrupt(args: argparse.Namespace) -> dict:
+    state = validate_state(load_json(args.checkpoint))
+    if not state["stopReason"] and not state["terminalReason"]:
+        state["terminalReason"] = "execution_interrupted"
+    write_atomic(args.checkpoint, state)
+    return state
+
+
+def command_resume(args: argparse.Namespace) -> dict:
+    state = validate_state(load_json(args.checkpoint))
+    if state["stopReason"]:
+        fail("cannot resume a completed checkpoint")
+    if state["terminalReason"] not in {"", "execution_timeout", "execution_interrupted"}:
+        fail("cannot resume a checkpoint with a non-recoverable terminal reason")
+    for page in sorted(state["inFlightPages"]):
+        prior = retry_entry(state, page)
+        queue_retry(state, page, prior["attempts"] if prior else 0, "execution_interrupted")
+    state["inFlightPages"] = []
+    state["terminalReason"] = ""
+    state["deadlineEpoch"] = deadline_from_started_epoch(args.started_epoch)
+    expire_if_needed(state)
+    write_atomic(args.checkpoint, state)
+    return state
+
+
+def state_summary(state: dict) -> dict:
+    remaining = 0 if not state["deadlineEpoch"] else max(0, state["deadlineEpoch"] - now_epoch())
+    return {
+        "nextPage": state["nextPage"],
+        "nextCommitPage": state["nextCommitPage"],
+        "uniqueKeywords": len(state["keywordMap"]),
+        "noNewPages": state["noNewPages"],
+        "stopReason": state["stopReason"],
+        "terminalReason": state["terminalReason"],
+        "deadlineEpoch": state["deadlineEpoch"],
+        "secondsRemaining": remaining,
+        "inFlightPages": state["inFlightPages"],
+        "retryPages": [entry["page"] for entry in state["retryQueue"]],
+        "pendingPages": sorted(int(page) for page in state["pendingPages"]),
+        "reservedPages": state.get("reservedPages", []),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("now")
     init = sub.add_parser("init")
     init.add_argument("--checkpoint", required=True, type=Path)
     init.add_argument("--marketplace", required=True)
     init.add_argument("--date", required=True)
     init.add_argument("--search-model", required=True, type=int)
+    init.add_argument("--started-epoch", required=True, type=int)
     init.add_argument("--first-page", default=1, type=int)
     reserve = sub.add_parser("reserve")
     reserve.add_argument("--checkpoint", required=True, type=Path)
@@ -226,22 +399,29 @@ def main() -> int:
     retry = sub.add_parser("retry")
     retry.add_argument("--checkpoint", required=True, type=Path)
     retry.add_argument("--page", required=True, type=int)
+    for command_name in ("check", "interrupt"):
+        command = sub.add_parser(command_name)
+        command.add_argument("--checkpoint", required=True, type=Path)
+    resume = sub.add_parser("resume")
+    resume.add_argument("--checkpoint", required=True, type=Path)
+    resume.add_argument("--started-epoch", required=True, type=int)
     args = parser.parse_args()
     try:
+        if args.command == "now":
+            print(json.dumps({"nowEpoch": now_epoch()}, ensure_ascii=False))
+            return 0
         handlers = {
-            "init": command_init, "reserve": command_reserve, "stage": command_stage, "fail": command_fail,
-            "retry": command_retry
+            "init": command_init,
+            "reserve": command_reserve,
+            "stage": command_stage,
+            "fail": command_fail,
+            "retry": command_retry,
+            "check": command_check,
+            "interrupt": command_interrupt,
+            "resume": command_resume,
         }
         state = handlers[args.command](args)
-        print(json.dumps({
-            "nextPage": state["nextPage"],
-            "nextCommitPage": state["nextCommitPage"],
-            "uniqueKeywords": len(state["keywordMap"]),
-            "noNewPages": state["noNewPages"],
-            "stopReason": state["stopReason"],
-            "terminalReason": state["terminalReason"],
-            "reservedPages": state.get("reservedPages", []),
-        }, ensure_ascii=False))
+        print(json.dumps(state_summary(state), ensure_ascii=False))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"checkpoint_state: {exc}", file=sys.stderr)
