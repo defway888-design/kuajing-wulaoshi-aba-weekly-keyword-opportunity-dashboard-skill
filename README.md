@@ -1,24 +1,24 @@
-# 跨境吴老师 ABA 周交集关键词机会 BI 看板 Skill
+# 跨境吴老师异动需求机会BI看板 Skill
 
 本 Skill 为跨境吴老师专用模板，未经授权不得移除、替换或弱化 Skill 名称、执行提示和页面标题中的跨境吴老师标识。
 
 ## 一、Skill 用途与适用场景
 
-基于卖家精灵 ABA 周度数据，将“快速飙升市场”和“异动市场”的英文关键词做精确交集，生成可离线打开的机会 BI 看板。
+基于卖家精灵 ABA 周度数据，将“快速飙升市场”和“异动市场”的英文关键词做精确交集，为每个共同词生成 AI 中文翻译，生成可离线打开的 BI 看板。
 
 - 发现两个相邻周 ABA 市场共同出现的关键词机会。
-- 按 ABA 排名、周搜索增长倍数和机会类型筛选关键词。
+- 按当前 ABA 排名和前周异动排名筛选共同关键词，并提供一对一的中文释义。
 - 生成不依赖外部资源的单文件 HTML 看板。
 
 ## 二、启动方式
 
 在 Codex 中输入：
 
-    使用 $aba-weekly-keyword-opportunity-dashboard 生成 ABA 周交集关键词机会 BI 看板。
+    使用 $aba-weekly-keyword-opportunity-dashboard 生成跨境吴老师异动需求机会BI看板。
 
 未提供站点时，Skill 固定提示：
 
-    跨境吴老师正在等待 Amazon 站点输入：ABA 周交集关键词机会 BI 看板已启动。请输入 Amazon 站点（US、UK、AU、CA、JP、DE、FR、IT、ES、MX、BR、IN、AE）；留空默认 US。
+    跨境吴老师正在等待 Amazon 站点输入：异动需求机会BI看板已启动。请输入 Amazon 站点（US、UK、AU、CA、JP、DE、FR、IT、ES、MX、BR、IN、AE）；留空默认 US。
 
 ## 三、首次安装
 
@@ -28,7 +28,7 @@
 
 打开 Codex，新建一个对话，输入：
 
-    请从以下 GitHub 仓库安装跨境吴老师 ABA 周交集关键词机会 BI 看板 Skill：
+    请从以下 GitHub 仓库安装跨境吴老师异动需求机会BI看板 Skill：
     https://github.com/defway888-design/kuajing-wulaoshi-aba-weekly-keyword-opportunity-dashboard-skill
 
 按照 Codex 提示完成 GitHub 授权。
@@ -39,26 +39,28 @@
 
 ## 四、执行结果
 
-Skill 会先唯一绑定当前环境中的卖家精灵周度 ABA 数据能力，再验证最新可用周与前一周；随后按限流、分页、检查点和精确交集规则处理数据，并交付单文件 HTML 看板。执行器会优先重试最低页码的失败页、阻止跨越断点预取，并将单次运行的 15 分钟绝对截止写入检查点。页面标题和页眉均显示“跨境吴老师”。
+Skill 会先唯一绑定当前环境中的卖家精灵周度 ABA 数据能力；有已明确提供的 ABA 与翻译适配器时，由 Runner 在一个本地进程内验证周次、分页、精确交集、中文翻译和构建 HTML。否则使用连续的 Codex MCP 编排，由当前任务中的 AI 在交集确定后一次性翻译，绝不伪造本地接口。执行器会优先重试最低页码的失败页、阻止跨越断点预取，但不以全流程时长终止或阻塞执行。页面标题和页眉均显示“跨境吴老师”。
 
-若工具绑定不明确、周次不可用、分页重试耗尽、执行超时或批量分类失败，则输出受控的异常状态，不会交付部分数据。
+若工具绑定、ABA/翻译适配器不明确、周次不可用或分页重试耗尽，则输出受控的异常状态，不会交付部分数据。
 
-执行中会按真实状态提示“跨境吴老师正在准备 / 检查 / 获取 / 生成 / 发布”；完成时提示“跨境吴老师 ABA 周交集关键词机会 BI 看板已完成。”
+共同关键词明细的“中文翻译（AI）”仅用于理解关键词含义，不属于卖家精灵原始字段或官方翻译。执行中会按真实状态提示“跨境吴老师正在准备 / 检查 / 获取 / 生成 / 发布”；完成时提示“跨境吴老师异动需求机会BI看板已完成。”
 
 ## 五、仓库文件
 
 - SKILL.md：执行规则、固定启动引导语与交付逻辑。
 - agents/openai.yaml：Codex 界面元数据。
 - references/aba-weekly-opportunity-contract.md：数据、恢复、文件命名和验收契约。
+- scripts/aba_local_runner.py：通过显式本地 ABA 与翻译适配器一次性执行周次探测、分页、交集、中文翻译与构建。
 - scripts/checkpoint_state.py：并发分页的有序提交与检查点管理。
 - scripts/build_dashboard.py：固定模板、数据结构、文件名和离线依赖校验。
 - assets/aba_weekly_keyword_opportunity_template.html：唯一允许使用的离线看板模板。
 
 ## 六、使用注意
 
-- 只允许调用已唯一绑定的 aba_research_weekly；不得使用 ABA 趋势或月度历史接口。
+- 只允许调用已唯一绑定的 aba_research_weekly；只从卖家精灵使用 keyword 和 searchRank。
 - 不得修改固定 HTML 模板；只可替换嵌入数据占位符。
-- 不在 HTML、明细、详情、Top 10 或最终回复中展示 searches 原值。
+- 不得生成未确认的搜索量、增长倍数、机会类型；中文翻译必须在精确交集完成后由 AI 或明确翻译适配器一对一补全，并标注为 AI 翻译。
+- Runner 只接受当前环境明确提供的 ABA 与翻译适配器命令；不得从配置文件读取凭据、猜测 MCP 地址或硬编码服务别名。
 - 不要将 GitHub 密码、访问令牌或其他凭据提交到仓库。
 - 不得移除、替换或弱化任何面向用户的“跨境吴老师”品牌标识。
 
@@ -66,9 +68,9 @@ Skill 会先唯一绑定当前环境中的卖家精灵周度 ABA 数据能力，
 
 | 版本 | 发布日期 | 功能更新 | GitHub 主要提交 |
 | --- | --- | --- | --- |
+| v1.3.0 | 2026-08-07 | 升级为异动需求机会BI看板：取消全流程 15 分钟截止，支持本地 Runner 显式翻译适配器，并在共同关键词明细新增中文翻译（AI）。 | [本次发布主提交](https://github.com/defway888-design/kuajing-wulaoshi-aba-weekly-keyword-opportunity-dashboard-skill/commit/main) |
 | v1.2.0 | 2026-08-07 | 修复周度 ABA 分页执行编排：失败页优先重试、批次屏障、可恢复中断和持久化 15 分钟截止。 | [5aadfdc](https://github.com/defway888-design/kuajing-wulaoshi-aba-weekly-keyword-opportunity-dashboard-skill/commit/5aadfdcc459eb6f1a92a2ff80e34efcb69a15179) |
 | v1.1.0 | 2026-08-07 | 应用最新跨境吴老师品牌封装：统一所有权声明、真实执行状态提示、Codex 元数据与离线看板可见标题。 | [0094813](https://github.com/defway888-design/kuajing-wulaoshi-aba-weekly-keyword-opportunity-dashboard-skill/commit/00948138eb6160898ca23f6967189e1cc37cf380) |
 | v1.0.0 | 2026-08-07 | 首次发布：周次验证、并发有序分页检查点、关键词精确交集与离线 BI 看板校验。 | [2b92cb7](https://github.com/defway888-design/kuajing-wulaoshi-aba-weekly-keyword-opportunity-dashboard-skill/commit/2b92cb7d5559ac44d66a9cea962b3e08c2db97c5) |
 
 **后续每次发布功能更新，均在下表新增一行。GitHub 提交记录只记录该功能变更对应的主要提交；仅补充或修订说明文档时，不新增功能版本，也不新增版本记录行。**
-

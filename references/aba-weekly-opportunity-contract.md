@@ -1,113 +1,88 @@
-# 跨境吴老师 ABA 周交集机会看板数据与交付契约
+# 跨境吴老师异动需求机会BI看板数据与交付契约
 
 本 Skill 为跨境吴老师专用模板，未经授权不得移除、替换或弱化 Skill 名称、执行提示和页面标题中的跨境吴老师标识。
 
-## 数据范围与周次锁定
+## 数据范围
 
-- 只使用已唯一绑定的 aba_research_weekly 业务能力。
-- 最新可用周固定代表“快速飙升市场”，使用 searchModel=4；前一周固定代表“异动市场”，使用 searchModel=2。
-- 只请求并使用 keyword、searchRank、searches。若工具将字段投影参数命名为其他名称，仅在工具描述明确表达相同语义时映射。
-- 两次周次探测必须同时满足：业务响应 code="OK"，并且返回至少一条可用记录。包装层只能在字段语义已文档化时映射到这个判断。
-- 禁止调用 ABA 趋势、月度 ABA、近 24 个月月度历史及任何会返回月度趋势字段的能力。
+- 唯一数据业务是已唯一绑定的 `aba_research_weekly`。
+- 最新可用周使用 `searchModel=4`（快速飙升市场），前一周使用 `searchModel=2`（异动市场）。
+- 每个业务请求只使用 `marketplace`、周六 `date`、`searchModel`、`page`、`size=40` 与字段投影 `keyword,searchRank`。
+- 周度接口元数据未确认“周搜索量”字段语义；不得请求、保存、计算或展示 searches、增长倍数、机会类型、趋势或月度数据。`keywordZh` 是交集确定后由 AI 独立生成的中文翻译，不属于卖家精灵返回字段。
+- 探测周对时，两次 page=1、size=1 响应均须为 `code="OK"` 且各含一条记录；最多向前检查 12 组周六。
 
-## 检查点和页序提交
+## 本地 Runner 适配器
 
-对每个市场建立独立检查点。使用 checkpoint_state.py 的 init、reserve、stage、fail 和 retry 命令，检查点只用于本次运行恢复，不得随 ready HTML 交付。
+`scripts/aba_local_runner.py` 是单进程执行器。它不读取 Codex 配置、不发现服务、不保存密钥，也不能替代 MCP 工具绑定。
 
-    version, marketplace, date, searchModel, deadlineEpoch
+只有当前环境明确提供适配器命令时才可调用 Runner。适配器的单次输入、输出均固定为 UTF-8 JSON：
+
+```json
+{"operation":"aba_research_weekly","request":{"marketplace":"US","date":"yyyyMMdd","searchModel":4,"page":1,"size":40,"returnFields":"keyword,searchRank"}}
+```
+
+```json
+{"code":"OK","items":[{"keyword":"english keyword","searchRank":1}]}
+```
+
+- 适配器负责将实际 MCP 包装层规范为上述输出；不得附加原始响应、密钥、错误正文或多余字段。
+- Runner 只通过无 shell 的 JSON 命令数组启动适配器；Windows shell 优先传入 UTF-8 JSON 命令数组文件。
+- 未提供适配器时，使用一次连续的 Codex MCP 编排，而非伪造 HTTP、别名或本地服务。
+
+## 中文翻译适配器
+
+本地 Runner 生成正式 ready HTML 时，翻译适配器也必须由当前环境明确提供；它不读取 Codex 配置、服务地址或密钥。单次输入、输出固定为 UTF-8 JSON：
+
+```json
+{"operation":"translate_keywords","sourceLanguage":"en","targetLanguage":"zh-CN","keywords":["english keyword"]}
+```
+
+```json
+{"items":[{"keyword":"english keyword","keywordZh":"中文翻译"}]}
+```
+
+- 翻译输出必须与最终英文交集一一对应、无重复、无遗漏，且每个 `keywordZh` 非空并包含中文字符。
+- 页面中必须以“中文翻译（AI）”标注该字段；它仅用于理解词义，不是卖家精灵原始字段或官方翻译。
+- 没有明确翻译适配器时，不得为本地 Runner 编造翻译；交集非空则输出 `translation_adapter_unavailable`。受控 MCP 编排可由当前任务中的 AI 在精确交集完成后一次性生成同一字段。
+
+## 检查点与分页
+
+每个市场独立保存：
+
+    version, marketplace, date, searchModel
     nextPage, nextCommitPage, inFlightPages, pendingPages, committedPages
     keywordMap, noNewPages, retryQueue, stopReason, terminalReason
 
-请求语义：
-
-    marketplace = 用户站点
-    date        = 经验证的周六（yyyyMMdd）
-    searchModel = 4 或 2
-    page        = 当前页
-    size        = 40
-    fields      = keyword,searchRank,searches
-
-在工具发现前记录一次 `runStartedEpoch`；两个市场的 init 都传入此值，检查点据此保存 `deadlineEpoch = runStartedEpoch + 900`。每次 reserve、retry、stage、fail 和显式 check 都会核验该绝对截止；不得在第二个市场、重试或恢复时重置。
-
-reserve 一次最多分配三页，且只允许在没有在途页、重试页和待提交页时执行。页面可以乱序返回，但必须先让整批页面 stage 或 fail；存在失败页时只能 retry 页码最小的失败页，禁止 reserve 更高页。stage 只能从 nextCommitPage 起连续提交；每次提交才计算唯一词、连续无新增页和停止条件。这样既保留批内并发，又保证“首次成功记录”和“五页连续无新增”按页码语义成立。
-
-若提交后达到 2,000 个唯一词或五页连续无新增，立即设置 stopReason；不再 reserve，且忽略截止或中断后才返回的高页结果。两个市场顺序抓取，整体（不是每一侧）最大并发三。批次开始后等待至少 2 秒乘本批页数再发下一批，确保平均不高于每两秒一次请求、每分钟不超过 30 次。
-
-运行剩余不超过 30 秒时不再派发新页。到 `deadlineEpoch` 后，脚本把 terminalReason 设为 `execution_timeout` 并拒绝迟到 stage；外部 MCP 调用若已经悬挂，只能在返回后被拒收，不能由检查点脚本强行终止。
-
-## 失败和恢复决策
-
-| 条件 | 行动 | HTML 状态 | 检查点 |
-| --- | --- | --- | --- |
-| 站点无效 | 仅要求重新输入；不调用工具 | 不生成 | 不创建 |
-| 工具绑定不唯一或不明确 | 返回 blocked: tool_binding_ambiguous；不生成 | 不生成 | 不创建 |
-| 12 周内无有效周对 | 停止，不猜日期 | blocked，日期为空 | 不创建 |
-| ERROR_MAXIMUM_ACCESS_PER_MINUTE | 写入脱敏 code，等待 70 秒；优先重试最小失败页 | 继续 | 保留 |
-| 其他瞬时错误 | 写入脱敏错误类别；当前页等待 5、15、30 秒重试 | 继续 | 保留 |
-| 瞬时错误三次仍失败 | 写 terminalReason=page_retry_exhausted | blocked，日期为空 | 保留 |
-| 全流程满 15 分钟 | `check` 写 terminalReason=execution_timeout；停止派发与重试 | blocked，日期为空 | 保留 |
-| 用户明确中断 | `interrupt` 标记执行中断，不接纳迟到结果 | 不生成 | 保留 |
-| 用户明确要求恢复 | `resume` 回收残留在途页，使用新的 15 分钟运行窗口 | 继续 | 保留 |
-| 批量翻译或分类不可恢复失败 | 不交付部分结果 | blocked，日期为空 | 保留 |
-| 两侧完成但交集为空 | 交付空表看板 | ready | 成功后删除 |
-
-blocked 数据必须为：
-
-    {
-      "status": "blocked",
-      "blockReason": "<deterministic reason>",
-      "marketplace": "US",
-      "latestWeek": "",
-      "previousWeek": "",
-      "items": []
-    }
-
-可用的确定性原因只使用：no_valid_week_pair、page_retry_exhausted、execution_timeout、batch_enrichment_failed。不要在 blockReason 中附原始响应或 searches。
-
-失败页的 checkpoint reason 只允许保存业务 code、HTTP/连接类别或 `page_error` 等脱敏类别；最终简报只报告失败页码和类别，不报告关键词、原始响应或 searches。
-
-## 转换规则
-
-1. 仅保留两侧均存在的英文关键词。
-2. 两侧 searches 都是正数时，计算 growthMultiple = latestSearches / previousSearches；否则剔除。
-3. 显示增长倍数时使用两位小数和 ×，但数据保存为数值。
-4. 批量补充中文翻译并按以下优先级一次性分类：
-   1. 品牌/专名
-   2. 图书/内容
-   3. 节日/季节
-   4. 商品/工具
-5. 明显品牌词、书名、作者名、角色名或无法可靠翻译的专名，英文保留，中文写为 品牌词/书名/专名。
+- 每批最多三页，整批返回都 stage 或 fail 后才可 reserve 下一批；两个市场顺序执行，所有市场合计并发最多三。
+- `keywordMap` 只以原始英文关键词区分大小写去重；只在页码连续提交时更新唯一词数、连续无新增页数与停止条件。
+- 达到 2,000 个唯一词或连续五页无新增后停止 reserve。不得接受中断后返回的页。
+- 每批完成后至少等待 `2 × 本批请求数` 秒，确保平均不超过每分钟 30 次。
+- 失败时只重试最小页码。`ERROR_MAXIMUM_ACCESS_PER_MINUTE` 等待 70 秒；其他瞬时错误等待 5、15、30 秒，第三次仍失败则 `page_retry_exhausted`。
+- 不设置全流程时长上限。单次适配器通信超时只用于识别失联的本地适配器，不得作为正常分页或周次探测的总时长判定。用户中断为 `execution_interrupted`，不生成 HTML。只有显式 `--resume` 才能使用 work-dir 中唯一的保留检查点。
 
 ## 嵌入数据
 
-ready 数据仅接受以下顶层字段：
+ready 只接受：
 
-    {
-      "status": "ready",
-      "blockReason": "",
-      "marketplace": "US",
-      "latestWeek": "2026年07月18日",
-      "previousWeek": "2026年07月11日",
-      "items": [
-        {
-          "keyword": "example keyword",
-          "zh": "示例中文",
-          "currentAbaRank": 1,
-          "previousWeekAnomalyRank": 2,
-          "growthMultiple": 2.5,
-          "type": "商品/工具"
-        }
-      ]
-    }
+```json
+{
+  "status":"ready",
+  "blockReason":"",
+  "marketplace":"US",
+  "latestWeek":"2026年07月25日",
+  "previousWeek":"2026年07月18日",
+  "items":[
+    {"keyword":"example keyword","keywordZh":"示例关键词","currentAbaRank":1,"previousWeekAnomalyRank":2}
+  ]
+}
+```
 
-items 的每一项只能含示例所列六个字段，最多 2,000 项。不得携带 searches、调试信息或原始 API 字段。ready 的两个日期必须是中文格式，且相差七天；items 允许为空。
+- items 最多 2,000 项，仅以上四个字段；`keywordZh` 必须为非空中文 AI 翻译，两侧排名必须为正整数。
+- 两个 ready 周次必须相差七天；交集为空仍可 ready。
+- blocked 只允许 `no_valid_week_pair`、`page_retry_exhausted`、`runner_adapter_failed`、`translation_adapter_unavailable` 或 `translation_adapter_failed`，且日期和 items 必须为空。
 
-## 文件名、附件与验收
+## 文件与验收
 
-- ready 文件名严格为 aba_weekly_keyword_opportunity_<站点>_<最新周yyyyMMdd>.html。
-- 仅当没有可验证的最新周时，blocked 文件名严格为 aba_weekly_keyword_opportunity_<站点>_unavailable.html。
-- 没有可写本地目录时，通过平台附件交付同一 HTML；不得以 CSV、外部 JSON、固定端口或 localhost 服务替代。
-- 模板 SHA-256 由构建脚本锁定，且只接受一个数据占位符。生成时只允许替换该占位符。
-- 构建脚本会拒绝 fetch、XHR、WebSocket、EventSource、远程 URL、外部资源标签、@import、localhost 和月度趋势字段。
-- 模板哈希验证通过后，页面固定包含标题、站点与两个周次卡片、搜索框、三种固定排序、四种固定类型筛选、六列表格、详情与 Top 10；前一周卡片只能标注“异动市场”。
-- 明细表、详情和 Top 10 均不得展示 searches 原值。
+- ready 文件名：`aba_weekly_anomaly_demand_opportunity_<站点>_<最新周yyyyMMdd>.html`。
+- blocked 文件名：`aba_weekly_anomaly_demand_opportunity_<站点>_unavailable.html`。
+- 模板哈希由构建脚本锁定，只替换唯一的数据占位符。
+- 成品必须离线可用，且不得包含外部请求、服务地址、临时检查点或未确认的数据字段。

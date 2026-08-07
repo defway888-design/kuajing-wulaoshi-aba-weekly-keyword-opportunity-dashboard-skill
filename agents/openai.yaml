@@ -1,4 +1,4 @@
 interface:
-  display_name: "跨境吴老师 ABA 周交集关键词机会 BI 看板"
-  short_description: "跨境吴老师专用的离线 ABA 周交集关键词机会 BI 看板"
-  default_prompt: "Use $aba-weekly-keyword-opportunity-dashboard to generate a 跨境吴老师 ABA weekly keyword opportunity dashboard."
+  display_name: "跨境吴老师异动需求机会BI看板"
+  short_description: "跨境吴老师专用的 ABA 周交集与中文释义离线看板"
+  default_prompt: "Use $aba-weekly-keyword-opportunity-dashboard to generate a 跨境吴老师异动需求机会BI看板 with AI Chinese translations for every shared English keyword."

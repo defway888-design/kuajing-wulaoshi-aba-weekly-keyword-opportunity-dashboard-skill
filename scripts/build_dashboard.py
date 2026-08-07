@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Inject normalized data into the immutable offline ABA dashboard template."""
+"""Inject normalized data into the immutable demand-opportunity dashboard."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import math
 import re
 import sys
 from datetime import datetime
@@ -17,15 +16,16 @@ ALLOWED_MARKETPLACES = {
 }
 TOP_LEVEL_KEYS = {"status", "blockReason", "marketplace", "latestWeek", "previousWeek", "items"}
 ITEM_KEYS = {
-    "keyword", "zh", "currentAbaRank", "previousWeekAnomalyRank", "growthMultiple", "type"
+    "keyword", "keywordZh", "currentAbaRank", "previousWeekAnomalyRank"
 }
-TYPES = {"商品/工具", "图书/内容", "节日/季节", "品牌/专名"}
 BLOCK_REASONS = {
-    "no_valid_week_pair", "page_retry_exhausted", "execution_timeout", "batch_enrichment_failed"
+    "no_valid_week_pair", "page_retry_exhausted", "runner_adapter_failed",
+    "translation_adapter_unavailable", "translation_adapter_failed"
 }
 DATE_PATTERN = re.compile(r"^\d{4}年\d{2}月\d{2}日$")
+HAN_PATTERN = re.compile(r"[\u3400-\u9fff]")
 PLACEHOLDER = "__ABA_OPPORTUNITY_DATA_JSON__"
-TEMPLATE_SHA256 = "2dba23cc67a60353eb824962fe778f114b92666fbbeddd981f33bc8df704a563"
+TEMPLATE_SHA256 = "77f9eb905a3b2c2efe7b7b63744826701e6d48fafdb0a24b2346b8a6deb08940"
 FORBIDDEN_STATIC_PATTERNS = (
     re.compile(r"\bfetch\s*\(", re.IGNORECASE),
     re.compile(r"\b(?:XMLHttpRequest|WebSocket|EventSource)\b", re.IGNORECASE),
@@ -36,17 +36,13 @@ FORBIDDEN_STATIC_PATTERNS = (
     re.compile(r"monthlyTrendRecent24", re.IGNORECASE),
 )
 REQUIRED_TEMPLATE_MARKERS = (
-    "<h1>跨境吴老师 ABA 周交集机会 BI 看板</h1>",
+    "<h1>跨境吴老师异动需求机会BI看板</h1>",
     "<div class=\"label\">快速飙升市场</div>",
     "<div class=\"label\">异动市场</div>",
     "<option value=\"current\">现 ABA 排名升序</option>",
-    "<option value=\"growth\">周搜索增长倍数降序</option>",
     "<option value=\"previous\">前周异动排名升序</option>",
-    "<option>商品/工具</option>",
-    "<option>图书/内容</option>",
-    "<option>节日/季节</option>",
-    "<option>品牌/专名</option>",
-    "<th>英文关键词</th><th>中文翻译</th><th class=\"num\">现 ABA 排名</th><th class=\"num\">前周异动排名</th><th class=\"num\">搜索增长倍数</th><th>机会类型</th>",
+    "<th>英文关键词</th><th>中文翻译（AI）</th><th class=\"num\">现 ABA 排名</th><th class=\"num\">前周异动排名</th>",
+    "<h2>现 ABA 排名 Top 10</h2>",
     "const EMBEDDED_DATA=__ABA_OPPORTUNITY_DATA_JSON__",
 )
 
@@ -58,13 +54,6 @@ def fail(message: str) -> None:
 def positive_integer(value: object, field: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         fail(f"{field} must be a positive integer")
-
-
-def positive_number(value: object, field: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        fail(f"{field} must be a number")
-    if not math.isfinite(float(value)) or float(value) <= 0:
-        fail(f"{field} must be a finite positive number")
 
 
 def parse_chinese_date(value: str, field: str) -> datetime:
@@ -111,18 +100,18 @@ def validate(data: object) -> dict:
     seen = set()
     for index, item in enumerate(data["items"]):
         if not isinstance(item, dict) or set(item) != ITEM_KEYS:
-            fail(f"item {index} must contain only the six dashboard fields")
-        for field in ("keyword", "zh"):
-            if not isinstance(item[field], str) or not item[field].strip():
-                fail(f"item {index} {field} must be a non-empty string")
+            fail(f"item {index} must contain only keyword, keywordZh and two ABA ranks")
+        if not isinstance(item["keyword"], str) or not item["keyword"].strip():
+            fail(f"item {index} keyword must be a non-empty string")
         if item["keyword"] in seen:
             fail(f"item {index} duplicates keyword {item['keyword']}")
         seen.add(item["keyword"])
+        if not isinstance(item["keywordZh"], str) or not item["keywordZh"].strip():
+            fail(f"item {index} keywordZh must be a non-empty Chinese translation")
+        if not HAN_PATTERN.search(item["keywordZh"]):
+            fail(f"item {index} keywordZh must contain Chinese text")
         positive_integer(item["currentAbaRank"], f"item {index} currentAbaRank")
         positive_integer(item["previousWeekAnomalyRank"], f"item {index} previousWeekAnomalyRank")
-        positive_number(item["growthMultiple"], f"item {index} growthMultiple")
-        if item["type"] not in TYPES:
-            fail(f"item {index} type is invalid")
     return data
 
 
@@ -141,9 +130,31 @@ def validate_template(template: str, raw_template: bytes) -> None:
 
 def expected_filename(data: dict) -> str:
     if data["status"] == "blocked":
-        return f"aba_weekly_keyword_opportunity_{data['marketplace']}_unavailable.html"
+        return f"aba_weekly_anomaly_demand_opportunity_{data['marketplace']}_unavailable.html"
     date = data["latestWeek"].replace("年", "").replace("月", "").replace("日", "")
-    return f"aba_weekly_keyword_opportunity_{data['marketplace']}_{date}.html"
+    return f"aba_weekly_anomaly_demand_opportunity_{data['marketplace']}_{date}.html"
+
+
+def build(data: object, output: Path, template_path: Path) -> dict:
+    """Validate normalized data and create the only delivery HTML file."""
+    data = validate(data)
+    if output.name != expected_filename(data):
+        fail(f"output filename must be {expected_filename(data)}")
+    raw_template = template_path.read_bytes()
+    template = raw_template.decode("utf-8")
+    validate_template(template, raw_template)
+    embedded = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    html = template.replace(PLACEHOLDER, embedded)
+    if PLACEHOLDER in html or html.count("const EMBEDDED_DATA=") != 1:
+        fail("embedded data replacement failed")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(html, encoding="utf-8", newline="\n")
+    return {
+        "output": str(output),
+        "status": data["status"],
+        "marketplace": data["marketplace"],
+        "items": len(data["items"]),
+    }
 
 
 def main() -> int:
@@ -158,24 +169,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        data = validate(json.loads(args.data.read_text(encoding="utf-8")))
-        if args.output.name != expected_filename(data):
-            fail(f"output filename must be {expected_filename(data)}")
-        raw_template = args.template.read_bytes()
-        template = raw_template.decode("utf-8")
-        validate_template(template, raw_template)
-        embedded = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        html = template.replace(PLACEHOLDER, embedded)
-        if PLACEHOLDER in html or html.count("const EMBEDDED_DATA=") != 1:
-            fail("embedded data replacement failed")
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(html, encoding="utf-8", newline="\n")
-        print(json.dumps({
-            "output": str(args.output),
-            "status": data["status"],
-            "marketplace": data["marketplace"],
-            "items": len(data["items"]),
-        }, ensure_ascii=False))
+        data = json.loads(args.data.read_text(encoding="utf-8"))
+        print(json.dumps(build(data, args.output, args.template), ensure_ascii=False))
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"build_dashboard: {exc}", file=sys.stderr)
